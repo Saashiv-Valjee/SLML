@@ -1,5 +1,6 @@
 import os
 
+# Must be set before importing numpy/pandas/pyarrow-backed code.
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["OPENBLAS_NUM_THREADS"] = "1"
@@ -12,7 +13,7 @@ import numpy as np
 import pandas as pd
 from pathlib import Path
 from tqdm import tqdm
-from multiprocessing import Pool, cpu_count
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 DATA_DIR = Path(".")
 OUT_DIR = Path("processed")
@@ -47,8 +48,8 @@ def resize_sequence(seq, n_frames=N_FRAMES):
     if old_len <= 1:
         return np.repeat(seq, n_frames, axis=0).astype(np.float32)
 
-    old_idx = np.linspace(0, 1, old_len)
-    new_idx = np.linspace(0, 1, n_frames)
+    old_idx = np.linspace(0.0, 1.0, old_len)
+    new_idx = np.linspace(0.0, 1.0, n_frames)
 
     out = np.empty((n_frames, seq.shape[1]), dtype=np.float32)
 
@@ -62,7 +63,7 @@ def torso_normalize(seq):
     """
     Pose-aware normalization.
 
-    Feature layout:
+    Layout:
       left_hand  : 0:63
       right_hand : 63:126
       pose       : 126:225
@@ -71,10 +72,9 @@ def torso_normalize(seq):
       11 = left shoulder
       12 = right shoulder
 
-    Normalization:
-      - subtract shoulder centre per frame
-      - divide by shoulder width per frame
-      - fallback to global non-zero std if shoulders are degenerate
+    For each frame:
+      - subtract shoulder centre
+      - divide by shoulder width
     """
 
     seq = seq.copy()
@@ -91,10 +91,10 @@ def torso_normalize(seq):
         axis=1,
     )
 
-    valid_scale = shoulder_width > 1e-6
+    valid = shoulder_width > 1e-6
 
-    if valid_scale.any():
-        fallback_scale = np.median(shoulder_width[valid_scale])
+    if valid.any():
+        fallback_scale = np.median(shoulder_width[valid])
     else:
         nonzero = seq[seq != 0]
         fallback_scale = np.std(nonzero) if len(nonzero) else 1.0
@@ -102,9 +102,8 @@ def torso_normalize(seq):
     if fallback_scale < 1e-6:
         fallback_scale = 1.0
 
-    shoulder_width[~valid_scale] = fallback_scale
+    shoulder_width[~valid] = fallback_scale
 
-    # Apply to every xyz triplet.
     for start in range(0, FEATURE_DIM, 3):
         seq[:, start : start + 3] -= centre
         seq[:, start : start + 3] /= shoulder_width[:, None]
@@ -120,6 +119,9 @@ def load_sequence_fast(path):
 
     frames = np.sort(df["frame"].unique())
     n_frames = len(frames)
+
+    if n_frames == 0:
+        return np.zeros((1, FEATURE_DIM), dtype=np.float32)
 
     frame_to_i = {frame: i for i, frame in enumerate(frames)}
 
@@ -158,13 +160,41 @@ def process_one(job):
     path = DATA_DIR / rel_path
 
     seq = load_sequence_fast(path)
-
     original_frames = seq.shape[0]
 
     seq = resize_sequence(seq)
     seq = torso_normalize(seq)
 
-    return idx, seq, label, original_frames, participant_id, sign, sequence_id, rel_path
+    return {
+        "idx": idx,
+        "seq": seq,
+        "label": label,
+        "original_frames": original_frames,
+        "participant_id": participant_id,
+        "sign": sign,
+        "sequence_id": sequence_id,
+        "path": rel_path,
+        "error": None,
+    }
+
+
+def process_one_safe(job):
+    try:
+        return process_one(job)
+    except Exception as e:
+        idx, rel_path, label, participant_id, sign, sequence_id = job
+
+        return {
+            "idx": idx,
+            "seq": np.zeros((N_FRAMES, FEATURE_DIM), dtype=np.float32),
+            "label": label,
+            "original_frames": -1,
+            "participant_id": participant_id,
+            "sign": sign,
+            "sequence_id": sequence_id,
+            "path": rel_path,
+            "error": repr(e),
+        }
 
 
 def main():
@@ -190,6 +220,7 @@ def main():
     X_path = OUT_DIR / f"X_{N_FRAMES}f_{FEATURE_DIM}d.dat"
     y_path = OUT_DIR / f"y_{N_FRAMES}f.npy"
     meta_path = OUT_DIR / f"metadata_{N_FRAMES}f.csv"
+    error_path = OUT_DIR / f"errors_{N_FRAMES}f.csv"
 
     X = np.memmap(
         X_path,
@@ -201,8 +232,9 @@ def main():
     y = np.zeros(n_samples, dtype=np.int64)
 
     metadata_rows = []
+    error_rows = []
 
-    n_workers = 6
+    n_workers = int(os.environ.get("N_WORKERS", "8"))
 
     print(f"Samples     : {n_samples}")
     print(f"N_FRAMES    : {N_FRAMES}")
@@ -210,35 +242,38 @@ def main():
     print(f"Workers     : {n_workers}")
     print(f"Output X    : {X_path}")
 
-    with Pool(n_workers) as pool:
-        iterator = pool.imap_unordered(process_one, jobs, chunksize=64)
+    with ThreadPoolExecutor(max_workers=n_workers) as executor:
+        futures = [executor.submit(process_one_safe, job) for job in jobs]
 
-        for result in tqdm(iterator, total=n_samples):
-            (
-                idx,
-                seq,
-                label,
-                original_frames,
-                participant_id,
-                sign,
-                sequence_id,
-                rel_path,
-            ) = result
+        for future in tqdm(as_completed(futures), total=n_samples):
+            result = future.result()
 
-            X[idx] = seq
-            y[idx] = label
+            idx = result["idx"]
+
+            X[idx] = result["seq"]
+            y[idx] = result["label"]
 
             metadata_rows.append(
                 {
                     "idx": idx,
-                    "path": rel_path,
-                    "participant_id": participant_id,
-                    "sequence_id": sequence_id,
-                    "sign": sign,
-                    "label": label,
-                    "original_frames": original_frames,
+                    "path": result["path"],
+                    "participant_id": result["participant_id"],
+                    "sequence_id": result["sequence_id"],
+                    "sign": result["sign"],
+                    "label": result["label"],
+                    "original_frames": result["original_frames"],
+                    "error": result["error"],
                 }
             )
+
+            if result["error"] is not None:
+                error_rows.append(
+                    {
+                        "idx": idx,
+                        "path": result["path"],
+                        "error": result["error"],
+                    }
+                )
 
     X.flush()
 
@@ -247,10 +282,16 @@ def main():
     metadata = pd.DataFrame(metadata_rows).sort_values("idx")
     metadata.to_csv(meta_path, index=False)
 
+    errors = pd.DataFrame(error_rows)
+    errors.to_csv(error_path, index=False)
+
     print("\nSaved:")
     print(X_path)
     print(y_path)
     print(meta_path)
+    print(error_path)
+
+    print("\nErrors:", len(error_rows))
 
     print("\nTo load X later:")
     print(
