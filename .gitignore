@@ -1,4 +1,3 @@
-health/*
-train_landmark_files/*
-processed/*
+health
+train_landmark_files
 frame_counts.npy
