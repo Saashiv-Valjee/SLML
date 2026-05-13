@@ -1,3 +1,12 @@
+import os
+
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
+os.environ["ARROW_NUM_THREADS"] = "1"
+os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+
 import json
 import numpy as np
 import pandas as pd
@@ -193,7 +202,7 @@ def main():
 
     metadata_rows = []
 
-    n_workers = max(1, cpu_count() - 1)
+    n_workers = 6
 
     print(f"Samples     : {n_samples}")
     print(f"N_FRAMES    : {N_FRAMES}")
