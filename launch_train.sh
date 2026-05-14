@@ -10,18 +10,20 @@
 
 mkdir -p logs
 
-module purge
 module load cuda
 
-source ~/SLML/bin/activate
+source ~/SLML/SLML/bin/activate
+
+echo "Host:"
+hostname
 
 echo "Python:"
 which python
 
-echo "TensorFlow GPUs:"
-python -c "import tensorflow as tf; print(tf.config.list_physical_devices('GPU'))"
-
 echo "nvidia-smi:"
 nvidia-smi
+
+echo "TensorFlow GPUs:"
+python -c "import tensorflow as tf; print(tf.config.list_physical_devices('GPU'))"
 
 python train.py
